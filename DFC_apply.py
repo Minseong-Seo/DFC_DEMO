@@ -9,7 +9,7 @@ import pandas as pd
 # 0. User settings
 # =========================================================
 # 원본 BMS CSV 경로
-FILE_PATH = "EV6/bms_01241228106_2023-12.csv"
+FILE_PATH = "EV6/bms_01241228094_2023-02.csv"
 
 # DFC 결과 CSV 저장 폴더
 OUTPUT_DIR = "DFC_output"
@@ -184,6 +184,7 @@ def apply_delayed_full_charge(
     df_out[output_col] = df_out[soc_col]
     df_out[modified_col] = False
     df_out["DFC_NOTE"] = ""
+    df_out["DFC_FILLER"] = False
     T_buffer = pd.Timedelta(T_buffer)
 
     if "charge_group" in df_out.columns:
@@ -268,6 +269,44 @@ def apply_delayed_full_charge(
 
         new_end_time = next_drive_time - pd.Timedelta(T_buffer)
 
+        # ------ DFC 적용을 위한 시간축 확장 ------
+        # 충전 종료~다음 주행 사이에 로그가 부족하면 1초 간격 Rest row 생성
+        gap_df = df_out[
+            (df_out[time_col] > original_end_time) &
+            (df_out[time_col] < next_drive_time)
+        ].copy()
+
+        full_range = pd.date_range(
+            start=target_time,
+            end=next_drive_time,
+            freq="1s"
+        )
+
+        existing_times = set(df_out[time_col])
+        missing_times = [t for t in full_range if t not in existing_times]
+
+        if len(missing_times) > 0:
+            filler = pd.DataFrame({time_col: missing_times})
+
+            for col in df_out.columns:
+                if col in [time_col, "DFC_FILLER"]:
+                    continue
+                filler[col] = np.nan
+
+            filler["DFC_FILLER"] = True
+
+            filler[state_col] = "Rest"
+            filler["speed"] = 0
+            filler["acceleration"] = 0
+            filler["chrg_cable_conn"] = 1
+            filler[soc_col] = np.nan
+
+            df_out = pd.concat([df_out, filler], ignore_index=False)
+            df_out = df_out.sort_values(time_col)
+
+            # SOC는 여기서 보간하지 않는다.
+            # filler row는 DFC 프로파일을 배치하기 위한 시간축 역할만 수행한다.
+
         # ------ SOC_standby 이후 ~ 실제 충전 종료까지 원래 프로파일 tail 추출 ------
         tail_df = group_df[group_df[time_col] >= target_time].copy()
         if len(tail_df) < 2:
@@ -286,29 +325,58 @@ def apply_delayed_full_charge(
             df_out.loc[group_df.index, "DFC_NOTE"] = "Insufficient_window"
             continue
 
+        # 원래 충전 세션 row
+        original_session_mask = df_out.index.isin(group_df.index)
+        print(
+            f"group={group_id} session_rows={original_session_mask.sum()} tail_rows={len(tail_df)}"
+        )
+
+        # 이번 DFC 이벤트에서 생성된 filler row만 사용
+        filler_window_mask = (
+            (df_out["DFC_FILLER"] == True)
+            & (df_out[time_col] >= target_time)
+            & (df_out[time_col] < next_drive_time)
+        )
+
+        # 80% 유지 구간:
+        # 원래 충전 세션의 tail 부분 + 새 filler 시간축만 수정
+        hold_mask = (
+            (original_session_mask | filler_window_mask)
+            & (df_out[time_col] >= target_time)
+            & (df_out[time_col] < shifted_start_time)
+        )
+
+        # 재배치된 충전 프로파일 구간
+        apply_mask = (
+            (original_session_mask | filler_window_mask)
+            & (df_out[time_col] >= shifted_start_time)
+            & (df_out[time_col] <= new_end_time)
+        )
+
+        # Full charge 완료 후 출발 전까지 유지
+        full_hold_mask = (
+            (original_session_mask | filler_window_mask)
+            & (df_out[time_col] > new_end_time)
+            & (df_out[time_col] < next_drive_time)
+        )
+
         # ------ DFC 적용 ------
         # 1) target_time ~ shifted_start_time 전까지 SOC 유지
-        hold_mask = (
-            (df_out[time_col] >= target_time) &
-            (df_out[time_col] < shifted_start_time) &
-            (df_out[time_col] < next_drive_time) &
-            (df_out.index.isin(group_df.index))
-        )
         df_out.loc[hold_mask, output_col] = target_value
         df_out.loc[hold_mask, modified_col] = True
         df_out.loc[hold_mask, "DFC_NOTE"] = "DFC_applied"
 
         # 2) 원래 프로파일(충전 종료까지)을 shifted_start_time ~ new_end_time에 재배치
         shifted_times = shifted_start_time + (tail_df[time_col] - target_time)
-        apply_mask = (
-            (df_out[time_col] >= shifted_start_time) &
-            (df_out[time_col] <= new_end_time) &
-            (df_out[time_col] < next_drive_time) &
-            (df_out.index.isin(group_df.index))
-        )
         x_original = shifted_times.astype("int64")
         y_original = tail_df[soc_col].to_numpy()
         x_apply = df_out.loc[apply_mask, time_col].astype("int64")
+        print(
+            f"group={group_id} filler_rows={filler_window_mask.sum()} hold_rows={hold_mask.sum()} apply_rows={apply_mask.sum()}"
+        )
+        print(
+            f"DFC group={group_id} | tail_rows={len(tail_df)} | hold_rows={hold_mask.sum()} | apply_rows={apply_mask.sum()} | total_rows={len(df_out)}"
+        )
         if len(x_apply) > 0:
             df_out.loc[apply_mask, output_col] = np.interp(
                 x_apply,
@@ -319,11 +387,6 @@ def apply_delayed_full_charge(
             df_out.loc[apply_mask, "DFC_NOTE"] = "DFC_applied"
 
         # 3) full charge 완료 후 다음 주행 전까지는 원래 충전 종료 SOC 유지
-        full_hold_mask = (
-            (df_out[time_col] > new_end_time) &
-            (df_out[time_col] < next_drive_time) &
-            (df_out.index.isin(group_df.index))
-        )
         df_out.loc[full_hold_mask, output_col] = original_end_soc
         df_out.loc[full_hold_mask, modified_col] = True
         df_out.loc[full_hold_mask, "DFC_NOTE"] = "DFC_applied"
@@ -331,7 +394,7 @@ def apply_delayed_full_charge(
     # 결과를 원래 SOC 컬럼에 반영
     df_out[soc_col] = df_out[output_col]
     # 임시 컬럼 제거
-    df_out = df_out.drop(columns=[output_col, modified_col])
+    df_out = df_out.drop(columns=[output_col, modified_col, "DFC_FILLER"], errors="ignore")
     # DFC_NOTE 컬럼만 추가로 남김
     return df_out, None
 
